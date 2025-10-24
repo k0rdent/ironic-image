@@ -43,7 +43,6 @@ jobs:
           fi
 
       - name: Docker login to dev MSR
-        if: github.event_name == 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.DEV_REGISTRY_ENDPOINT }}
@@ -66,6 +65,17 @@ jobs:
         run: |
           docker build -t ${{ env.IMG }}:${{ env.TAG }} -f Dockerfile .
           docker push ${{ env.IMG }}:${{ env.TAG }}
+
+      - name: Push image to dev MSR
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          PROD_IMG: ${{ env.PROD_REGISTRY_ENDPOINT }}/k0rdent-bm/images/metal3-io/ironic
+          DEV_IMG: ${{ env.DEV_REGISTRY_ENDPOINT }}/k0rdent-bm/images/metal3-io/ironic
+          TAG: ${{ steps.version.outputs.version }}
+        run: |
+          docker tag ${{ env.PROD_IMG }}:${{ env.TAG }} ${{ env.DEV_IMG }}:${{ env.TAG }}
+          docker push ${{ env.DEV_IMG }}:${{ env.TAG }}
 
       - name: Write build summary
         shell: bash
