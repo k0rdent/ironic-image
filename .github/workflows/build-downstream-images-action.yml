@@ -14,10 +14,17 @@ on:
 jobs:
   build_ironic:
     name: Build Ironic container image with default base image
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     env:
       DEV_REGISTRY_ENDPOINT: registry.ci.mirantis.com
       PROD_REGISTRY_ENDPOINT: registry.mirantis.com
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: k0rdent-bm-lab
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -60,18 +67,18 @@ jobs:
       - name: Build and push image
         shell: bash
         env:
-          IMG: ${{ steps.registry.outputs.registry }}/k0rdent-bm/images/metal3-io/ironic
+          IMG: ${{ steps.registry.outputs.registry }}/k0rdent-bm/images/metal3-io/ironic-${{ matrix.arch }}
           TAG: ${{ steps.version.outputs.version }}
         run: |
-          docker build -t ${{ env.IMG }}:${{ env.TAG }} -f Dockerfile .
+          docker build --platform linux/${{ matrix.arch }} --build-arg IPXE_COMMIT_HASH=b41bda4413bf286d7b7a449bc05e1531da1eec2e -t ${{ env.IMG }}:${{ env.TAG }} -f Dockerfile .
           docker push ${{ env.IMG }}:${{ env.TAG }}
 
       - name: Push image to dev MSR
         if: github.event_name == 'push'
         shell: bash
         env:
-          PROD_IMG: ${{ env.PROD_REGISTRY_ENDPOINT }}/k0rdent-bm/images/metal3-io/ironic
-          DEV_IMG: ${{ env.DEV_REGISTRY_ENDPOINT }}/k0rdent-bm/images/metal3-io/ironic
+          PROD_IMG: ${{ env.PROD_REGISTRY_ENDPOINT }}/k0rdent-bm/images/metal3-io/ironic-${{ matrix.arch }}
+          DEV_IMG: ${{ env.DEV_REGISTRY_ENDPOINT }}/k0rdent-bm/images/metal3-io/ironic-${{ matrix.arch }}
           TAG: ${{ steps.version.outputs.version }}
         run: |
           docker tag ${{ env.PROD_IMG }}:${{ env.TAG }} ${{ env.DEV_IMG }}:${{ env.TAG }}
@@ -87,4 +94,4 @@ jobs:
           echo "| Git Reference | ${{ github.ref }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Git Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Version | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Path | ${{ steps.registry.outputs.registry }}/k0rdent-bm/images/metal3-io/ironic:${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Path | ${{ steps.registry.outputs.registry }}/k0rdent-bm/images/metal3-io/ironic-${{ matrix.arch }}:${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
