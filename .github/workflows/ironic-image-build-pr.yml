@@ -6,6 +6,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'metal3-io/ironic-image'
     runs-on: ${{ matrix.platform == 'linux/amd64' && 'ubuntu-latest' || matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm'}}
     strategy:
       fail-fast: false
