@@ -17,7 +17,7 @@ COPY scripts/openstack /usr/bin/openstack
 RUN apt-get update && \
     apt-get install -y genisoimage && \
     apt-get clean && \
-    pip3 install --prefix /usr/local --no-cache-dir python-ironicclient && \
+    pip3 install --prefix /usr/local --no-cache-dir 'python-ironicclient===6.0.0' && \
     chmod +x /usr/bin/openstack
 
 ENTRYPOINT ["/usr/local/bin/baremetal"]
