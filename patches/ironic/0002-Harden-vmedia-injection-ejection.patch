@@ -1,0 +1,533 @@
+From 0d853de019e0ec2ed65a6cf76824f309ef9276a1 Mon Sep 17 00:00:00 2001
+From: Vasyl Saienko <vsaienko@mirantis.com>
+Date: Sat, 4 Apr 2026 17:48:11 +0300
+Subject: [PATCH 2/2] Harden vmedia injection/ejection
+
+When working with vmedia in redfish make sure that iso
+is actually mounted/umounted via redfish polling
+bofore completing mount/umount call.
+---
+ ironic/drivers/modules/redfish/boot.py        | 124 ++++++++++++-
+ .../unit/drivers/modules/redfish/test_boot.py | 163 ++++++++++++++++--
+ .../drivers/modules/redfish/test_power.py     |   2 +-
+ 3 files changed, 272 insertions(+), 17 deletions(-)
+
+diff --git a/ironic/drivers/modules/redfish/boot.py b/ironic/drivers/modules/redfish/boot.py
+index 24467fd34..0153ec900 100644
+--- a/ironic/drivers/modules/redfish/boot.py
++++ b/ironic/drivers/modules/redfish/boot.py
+@@ -13,6 +13,8 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++import time
++
+ from oslo_log import log
+ import sushy
+ import tenacity
+@@ -92,6 +94,10 @@ COMMON_PROPERTIES.update(RESCUE_PROPERTIES)
+ 
+ IMAGE_SUBDIR = 'redfish'
+ 
++# Poll Redfish VirtualMedia after InsertMedia / EjectMedia (not configurable).
++_VIRTUAL_MEDIA_REDFISH_POLL_TIMEOUT = 120
++_VIRTUAL_MEDIA_REDFISH_POLL_INTERVAL = 3
++
+ 
+ def _parse_driver_info(node):
+     """Gets the driver specific Node deployment info.
+@@ -183,6 +189,108 @@ def _test_retry(exception):
+     return False
+ 
+ 
++def _vmedia_image_matches_url(image, boot_url):
++    """True if Redfish Image matches the URL we requested for the mount."""
++    if not image:
++        return False
++    if image == boot_url:
++        return True
++    return image.rstrip('/') == boot_url.rstrip('/')
++
++
++def _vmedia_resolve_for_poll(resource, v_media):
++    """Return the VirtualMedia member to poll (by slot identity if set)."""
++    slot_identity = getattr(v_media, 'identity', None)
++    if isinstance(slot_identity, (str, int)):
++        for candidate in resource.virtual_media.get_members():
++            if getattr(candidate, 'identity', None) == slot_identity:
++                return candidate
++    return v_media
++
++
++def _wait_vmedia_insert_confirmed(task, resource, v_media, boot_url,
++                                  boot_device):
++    """Poll Redfish until the virtual media slot reports inserted (and Image).
++
++    InsertMedia may return success before the VirtualMedia resource reflects
++    the new media. Optionally verify Image when the BMC provides it.
++    """
++    timeout = _VIRTUAL_MEDIA_REDFISH_POLL_TIMEOUT
++    interval = _VIRTUAL_MEDIA_REDFISH_POLL_INTERVAL
++    deadline = time.monotonic() + timeout
++
++    while time.monotonic() < deadline:
++        vm = _vmedia_resolve_for_poll(resource, v_media)
++        try:
++            vm.refresh(force=True)
++        except AttributeError:
++            pass
++        except Exception as exc:
++            LOG.debug('Virtual media refresh while confirming insert for '
++                      'node %(node)s: %(exc)s',
++                      {'node': task.node.uuid, 'exc': exc})
++
++        if vm.inserted:
++            image = getattr(vm, 'image', None)
++            if (isinstance(image, str) and image
++                    and not _vmedia_image_matches_url(image, boot_url)):
++                raise exception.InvalidParameterValue(
++                    _('Virtual media reports inserted image %(image)s but '
++                      'expected %(expected)s for node %(node)s on '
++                      '%(device)s.') % {
++                        'image': image,
++                        'expected': boot_url,
++                        'node': task.node.uuid,
++                        'device': boot_device})
++            if not image:
++                LOG.debug('Virtual media slot reports inserted=True but '
++                          'Image is not yet populated for node %(node)s; '
++                          'treating InsertMedia as confirmed.',
++                          {'node': task.node.uuid})
++            return
++
++        time.sleep(interval)
++
++    raise exception.InvalidParameterValue(
++        _('Timed out after %(timeout)s seconds waiting for virtual media '
++          'to report inserted=True for node %(node)s (device %(device)s).') % {
++            'timeout': timeout,
++            'node': task.node.uuid,
++            'device': boot_device})
++
++
++def _wait_vmedia_eject_confirmed(task, resource, v_media, boot_device):
++    """Poll Redfish until the virtual media slot reports media not inserted."""
++    timeout = _VIRTUAL_MEDIA_REDFISH_POLL_TIMEOUT
++    interval = _VIRTUAL_MEDIA_REDFISH_POLL_INTERVAL
++    deadline = time.monotonic() + timeout
++    device_desc = boot_device if boot_device is not None else v_media.name
++
++    while time.monotonic() < deadline:
++        vm = _vmedia_resolve_for_poll(resource, v_media)
++        try:
++            vm.refresh(force=True)
++        except AttributeError:
++            pass
++        except Exception as exc:
++            LOG.debug('Virtual media refresh while confirming eject for '
++                      'node %(node)s: %(exc)s',
++                      {'node': task.node.uuid, 'exc': exc})
++
++        if not vm.inserted:
++            return
++
++        time.sleep(interval)
++
++    raise exception.InvalidParameterValue(
++        _('Timed out after %(timeout)s seconds waiting for virtual media '
++          'to report inserted=False after eject for node %(node)s '
++          '(device %(device)s).') % {
++            'timeout': timeout,
++            'node': task.node.uuid,
++            'device': device_desc})
++
++
+ def _has_vmedia_via_systems(system):
+     """Indicates if virtual media is available through Systems
+ 
+@@ -374,12 +482,16 @@ def _insert_vmedia_in_resource(task, resource, boot_url, boot_device,
+                 continue
+ 
+         if v_media.inserted:
+-            if v_media.image == boot_url:
++            image = getattr(v_media, 'image', None)
++            if isinstance(image, str) and _vmedia_image_matches_url(
++                    image, boot_url):
+                 LOG.debug("Boot media %(boot_url)s is already "
+                           "inserted into %(boot_device)s for node "
+                           "%(node)s", {'node': task.node.uuid,
+                                        'boot_url': boot_url,
+                                        'boot_device': boot_device})
++                _wait_vmedia_insert_confirmed(task, resource, v_media,
++                                              boot_url, boot_device)
+                 return True
+ 
+             continue
+@@ -440,6 +552,8 @@ def _insert_vmedia_in_resource(task, resource, boot_url, boot_device,
+                 continue
+             raise
+ 
++        _wait_vmedia_insert_confirmed(task, resource, v_media, boot_url,
++                                      boot_device)
+         LOG.info("Inserted boot media %(boot_url)s into "
+                  "%(boot_device)s for node "
+                  "%(node)s", {'node': task.node.uuid,
+@@ -528,15 +642,17 @@ def _eject_vmedia_from_resource(task, resource, boot_device=None):
+                            'available_device': sushy.VIRTUAL_MEDIA_DVD})
+             else:
+                 continue
+-        inserted = v_media.inserted
+-        if inserted:
++        had_media = v_media.inserted
++        if had_media:
+             v_media.eject_media()
++            _wait_vmedia_eject_confirmed(task, resource, v_media,
++                                         boot_device)
+             found = True
+ 
+         LOG.info("Boot media is%(already)s ejected from "
+                  "%(boot_device)s for node %(node)s"
+                  "", {'node': task.node.uuid,
+-                      'already': '' if inserted else ' already',
++                      'already': '' if had_media else ' already',
+                       'boot_device': v_media.name})
+     return found
+ 
+diff --git a/ironic/tests/unit/drivers/modules/redfish/test_boot.py b/ironic/tests/unit/drivers/modules/redfish/test_boot.py
+index 13907a25b..d49d6101a 100644
+--- a/ironic/tests/unit/drivers/modules/redfish/test_boot.py
++++ b/ironic/tests/unit/drivers/modules/redfish/test_boot.py
+@@ -16,6 +16,7 @@
+ from unittest import mock
+ 
+ import sushy
++import time
+ 
+ from ironic.common import boot_devices
+ from ironic.common import exception
+@@ -35,6 +36,44 @@ from ironic.tests.unit.objects import utils as obj_utils
+ INFO_DICT = db_utils.get_test_redfish_info()
+ 
+ 
++def _stub_vmedia_insert_reports_mounted(mock_vm, image_url='img-url'):
++    """Configure insert_media to flip Redfish-like inserted/Image state."""
++
++    def _on_insert(*args, **kwargs):
++        mock_vm.inserted = True
++        mock_vm.image = image_url
++
++    mock_vm.insert_media.side_effect = _on_insert
++
++
++def _stub_vmedia_eject_reports_unmounted(mock_vm):
++    """Configure eject_media so Redfish-like inserted becomes False."""
++
++    def _on_eject(*args, **kwargs):
++        mock_vm.inserted = False
++        mock_vm.image = None
++
++    mock_vm.eject_media.side_effect = _on_eject
++
++
++def _patch_monotonic_for_vmedia_poll_timeout(values=(0, 0, 0, 6)):
++    """Patch ``time.monotonic`` for poll-timeout tests.
++
++    Returns scripted values first, then the real clock so libraries such as
++    tenacity do not exhaust a fixed ``side_effect`` list.
++    """
++    real_mono = time.monotonic
++    seq = iter(values)
++
++    def _fake():
++        try:
++            return next(seq)
++        except StopIteration:
++            return real_mono()
++
++    return mock.patch('time.monotonic', side_effect=_fake, autospec=True)
++
++
+ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+ 
+     def setUp(self):
+@@ -1501,6 +1540,7 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_manager.virtual_media.get_members.return_value = [
+                 mock_vmedia_cd, mock_vmedia_floppy]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_cd)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -1524,6 +1564,7 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_manager.virtual_media.get_members.return_value = [
+                 mock_vmedia_dvd]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_dvd)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -1555,6 +1596,7 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_manager.virtual_media.get_members.return_value = [
+                 mock_vmedia_dvd_1, mock_vmedia_dvd_2]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_dvd_2)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -1638,6 +1680,7 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_manager.virtual_media.get_members.return_value = [
+                 mock_vmedia_no_action, mock_vmedia_with_action]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_with_action)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -1680,6 +1723,7 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_manager.virtual_media.get_members.return_value = [
+                 mock_vmedia_405, mock_vmedia_success]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_success)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -1721,12 +1765,7 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             )
+             mock_manager = mock.MagicMock()
+ 
+-            mock_response = mock.MagicMock()
+-            mock_response.json.return_value = {
+-                "error": {"message": "Device is ejecting"}
+-            }
+-
+-            mock_vmedia_cd.insert_media.side_effect = mock_response
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_cd)
+             mock_manager.virtual_media.get_members.return_value = [
+                 mock_vmedia_cd]
+ 
+@@ -1735,6 +1774,59 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+ 
+             self.assertEqual(mock_vmedia_cd.insert_media.call_count, 1)
+ 
++    @mock.patch('time.sleep', lambda *args, **kwargs: None)
++    @mock.patch.object(redfish_boot, '_has_vmedia_via_systems', autospec=True)
++    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
++    def test__insert_vmedia_mount_confirm_timeout(
++            self, mock_sys, mock_vmd_sys):
++        mock_vmd_sys.return_value = False
++        with task_manager.acquire(self.context, self.node.uuid,
++                                  shared=True) as task:
++            mock_vmedia_cd = mock.MagicMock(
++                inserted=False,
++                media_types=[sushy.VIRTUAL_MEDIA_CD])
++            mock_manager = mock.MagicMock()
++            mock_manager.virtual_media.get_members.return_value = [
++                mock_vmedia_cd]
++
++            with mock.patch.multiple(
++                    redfish_boot,
++                    _VIRTUAL_MEDIA_REDFISH_POLL_TIMEOUT=5,
++                    _VIRTUAL_MEDIA_REDFISH_POLL_INTERVAL=1), \
++                    _patch_monotonic_for_vmedia_poll_timeout():
++                self.assertRaises(
++                    exception.InvalidParameterValue,
++                    redfish_boot._insert_vmedia,
++                    task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
++
++            mock_vmedia_cd.insert_media.assert_called_once_with(
++                'img-url', inserted=True, write_protected=True)
++
++    @mock.patch('time.sleep', lambda *args, **kwargs: None)
++    @mock.patch.object(redfish_boot, '_has_vmedia_via_systems', autospec=True)
++    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
++    def test__insert_vmedia_mount_wrong_image(self, mock_sys, mock_vmd_sys):
++        mock_vmd_sys.return_value = False
++        with task_manager.acquire(self.context, self.node.uuid,
++                                  shared=True) as task:
++            mock_vmedia_cd = mock.MagicMock(
++                inserted=False,
++                media_types=[sushy.VIRTUAL_MEDIA_CD])
++
++            def _wrong_image(*args, **kwargs):
++                mock_vmedia_cd.inserted = True
++                mock_vmedia_cd.image = 'http://other/wrong.iso'
++
++            mock_vmedia_cd.insert_media.side_effect = _wrong_image
++            mock_manager = mock.MagicMock()
++            mock_manager.virtual_media.get_members.return_value = [
++                mock_vmedia_cd]
++
++            self.assertRaises(
++                exception.InvalidParameterValue,
++                redfish_boot._insert_vmedia,
++                task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
++
+     @mock.patch('time.sleep', lambda *args, **kwargs: None)
+     @mock.patch.object(redfish_boot, '_has_vmedia_via_systems', autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+@@ -1802,6 +1894,9 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_redfish_utils.get_system.return_value.managers = [
+                 mock_manager]
+ 
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_cd)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_floppy)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_dvd)
+             redfish_boot.eject_vmedia(task)
+ 
+             mock_vmedia_cd.eject_media.assert_called_once_with()
+@@ -1835,6 +1930,7 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_redfish_utils.get_system.return_value.managers = [
+                 mock_manager]
+ 
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_cd)
+             redfish_boot.eject_vmedia(task, sushy.VIRTUAL_MEDIA_CD)
+ 
+             mock_vmedia_cd.eject_media.assert_called_once_with()
+@@ -1872,6 +1968,8 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_redfish_utils.get_system.return_value.managers = [
+                 mock_manager]
+ 
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_dvd_1)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_dvd_2)
+             redfish_boot.eject_vmedia(task, sushy.VIRTUAL_MEDIA_CD)
+ 
+             mock_vmedia_dvd_1.eject_media.assert_called_once_with()
+@@ -1882,6 +1980,38 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
+             mock_cleanup_iso.assert_called_once_with(task)
+             mock_cleanup_disk.assert_not_called()
+ 
++    @mock.patch('time.sleep', lambda *args, **kwargs: None)
++    @mock.patch.object(image_utils, 'cleanup_disk_image', autospec=True)
++    @mock.patch.object(image_utils, 'cleanup_iso_image', autospec=True)
++    @mock.patch.object(redfish_boot, '_has_vmedia_via_systems', autospec=True)
++    @mock.patch.object(redfish_boot, 'redfish_utils', autospec=True)
++    def test_eject_vmedia_confirm_timeout(
++            self, mock_redfish_utils, mock_vmd_sys, mock_cleanup_iso,
++            mock_cleanup_disk):
++        mock_vmd_sys.return_value = False
++        with task_manager.acquire(self.context, self.node.uuid,
++                                  shared=True) as task:
++            mock_vmedia_cd = mock.MagicMock(
++                inserted=True,
++                media_types=[sushy.VIRTUAL_MEDIA_CD])
++            mock_manager = mock.MagicMock()
++            mock_manager.virtual_media.get_members.return_value = [
++                mock_vmedia_cd]
++            mock_redfish_utils.get_system.return_value.managers = [
++                mock_manager]
++
++            with mock.patch.multiple(
++                    redfish_boot,
++                    _VIRTUAL_MEDIA_REDFISH_POLL_TIMEOUT=5,
++                    _VIRTUAL_MEDIA_REDFISH_POLL_INTERVAL=1), \
++                    _patch_monotonic_for_vmedia_poll_timeout():
++                self.assertRaises(
++                    exception.InvalidParameterValue,
++                    redfish_boot.eject_vmedia,
++                    task)
++
++            mock_vmedia_cd.eject_media.assert_called_once_with()
++
+     @mock.patch.object(redfish_boot, '_has_vmedia_via_systems', autospec=True)
+     @mock.patch.object(redfish_boot, 'redfish_utils', autospec=True)
+     def test_eject_vmedia_not_inserted(self, mock_redfish_utils, mock_vmd_sys):
+@@ -2961,6 +3091,7 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_system.return_value.virtual_media.get_members.return_value = [
+                 mock_vmedia_cd, mock_vmedia_floppy]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_cd)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -2984,6 +3115,7 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_system.return_value.virtual_media.get_members.return_value = [
+                 mock_vmedia_dvd]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_dvd)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -3016,6 +3148,7 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_system.return_value.virtual_media.get_members.return_value = [
+                 mock_vmedia_dvd_1, mock_vmedia_dvd_2]
+ 
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_dvd_2)
+             redfish_boot._insert_vmedia(
+                 task, [mock_manager], 'img-url', sushy.VIRTUAL_MEDIA_CD)
+ 
+@@ -3055,12 +3188,7 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             )
+             mock_manager = mock.MagicMock()
+ 
+-            mock_response = mock.MagicMock()
+-            mock_response.json.return_value = {
+-                "error": {"message": "Device is ejecting"}
+-            }
+-
+-            mock_vmedia_cd.insert_media.side_effect = mock_response
++            _stub_vmedia_insert_reports_mounted(mock_vmedia_cd)
+             mock_system.return_value.virtual_media.get_members.return_value = [
+                 mock_vmedia_cd]
+ 
+@@ -3119,6 +3247,9 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_system.virtual_media.get_members.return_value = [
+                 mock_vmedia_cd, mock_vmedia_floppy, mock_vmedia_dvd]
+ 
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_cd)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_floppy)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_dvd)
+             redfish_boot.eject_vmedia(task)
+ 
+             mock_vmedia_cd.eject_media.assert_called_once_with()
+@@ -3163,6 +3294,9 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_manager.virtual_media.get_members.return_value = [
+                 mock_vmedia_cd]
+ 
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_cd)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_floppy)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_dvd)
+             redfish_boot.eject_vmedia(task)
+ 
+             mock_vmedia_cd.eject_media.assert_called_once_with()
+@@ -3197,6 +3331,7 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_system.virtual_media.get_members.return_value = [
+                 mock_vmedia_cd, mock_vmedia_floppy]
+ 
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_cd)
+             redfish_boot.eject_vmedia(task, sushy.VIRTUAL_MEDIA_CD)
+ 
+             mock_vmedia_cd.eject_media.assert_called_once_with()
+@@ -3235,6 +3370,8 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_system.virtual_media.get_members.return_value = [
+                 mock_vmedia_dvd_1, mock_vmedia_dvd_2]
+ 
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_dvd_1)
++            _stub_vmedia_eject_reports_unmounted(mock_vmedia_dvd_2)
+             redfish_boot.eject_vmedia(task, sushy.VIRTUAL_MEDIA_CD)
+ 
+             mock_vmedia_dvd_1.eject_media.assert_called_once_with()
+@@ -3413,6 +3550,8 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
+             mock_vmedia_1.identity = "1"
+             mock_vmedia_1.media_types = [sushy.VIRTUAL_MEDIA_CD]
+             mock_vmedia_1.inserted = False
++            _stub_vmedia_insert_reports_mounted(
++                mock_vmedia_1, 'http://example.com/boot.iso')
+ 
+             # Mock resource with virtual media collection
+             mock_resource = mock.MagicMock()
+diff --git a/ironic/tests/unit/drivers/modules/redfish/test_power.py b/ironic/tests/unit/drivers/modules/redfish/test_power.py
+index 625df9b93..44ee28d59 100644
+--- a/ironic/tests/unit/drivers/modules/redfish/test_power.py
++++ b/ironic/tests/unit/drivers/modules/redfish/test_power.py
+@@ -15,8 +15,8 @@
+ 
+ from unittest import mock
+ 
+-import sushy
+ from oslo_service import loopingcall as lc
++import sushy
+ 
+ from ironic.common import exception
+ from ironic.common import states
+-- 
+2.39.5 (Apple Git-154)
+

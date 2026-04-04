@@ -199,29 +199,21 @@ filename as far as it's in the container context.
 
 ## Apply project patches to the images during build
 
-When building the image, it is possible to specify a patch of one or more
-upstream projects to apply to the image using the **PATCH_LIST** argument in
-the cli command, for example:
+Place patch files under `patches/<project>/` in the image build context. The
+build copies that tree to `/tmp/patches` and, after rendering
+`ironic-packages-list` with Jinja2, replaces any matching requirement with
+`ironic @ file:///sources/<repo>` (and similarly for other projects): the tree
+is cloned from `https://opendev.org/<project>.git` (override the host with the
+**GIT_HOST** build-arg if needed), patches are applied with `git apply` in
+alphabetical order per project, and pip installs from that directory. A plain
+`file://` URL is used because `git+file://` makes pip run `git clone`, which
+only copies committed objects and would skip uncommitted `git apply` changes.
 
-```bash
-podman build -t ironic-image -f Dockerfile --build-arg PATCH_LIST=my-patch-list
-```
+- **Single path segment** (for example `patches/ironic/`): clones
+  `openstack/<name>` (same as `openstack/ironic` for `patches/ironic/`).
+- **Two segments** (for example `patches/openstack/ironic/`): clones that full
+  path as the Git project.
 
-The **PATCH_LIST** argument is a path to a file under the image context.
-Its format is a simple text file that contains references to upstream patches
-for the ironic projects.
-Each line of the file is in the form:
-    **project_dir refspec (git_host)**
-where:
-
-- **project_dir** is the last part of the project url including the
-  organization, for example for ironic is _openstack/ironic_
-- **refspec** is the gerrit refspec of the patch we want to test, for example if
-  you want to apply the patch at
-  <https://review.opendev.org/c/openstack/ironic/+/800084>
-  the refspec will be _refs/changes/84/800084/22_
-  Using multiple refspecs is convenient in case we need to test patches that
-  are connected to each other, either on the same project or on different
-  projects.
-- **git_host** (optional) is the git host from which the project will be cloned.
-  If unset, `https://opendev.org` is used.
+The branch or commit comes from the rendered requirement line (for example
+`ironic @ git+https://opendev.org/openstack/ironic@<ref>`). If the line has no
+`@ref`, the repository default branch is used.

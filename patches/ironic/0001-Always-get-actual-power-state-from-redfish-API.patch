@@ -1,0 +1,493 @@
+From be63c571f6cc24e4b2355c4af974d54e8321ca21 Mon Sep 17 00:00:00 2001
+From: Vasyl Saienko <vsaienko@mirantis.com>
+Date: Sat, 4 Apr 2026 14:51:48 +0300
+Subject: [PATCH] Always get actual power state from redfish API
+
+Do not rely on any cache values or transitional states,
+get actual state from redfish and ensure it matches
+with target before say we ready.
+---
+ ironic/drivers/modules/redfish/power.py       |  74 +++++++-
+ .../drivers/modules/redfish/test_power.py     | 172 ++++++++----------
+ ...ing-off-transitional-c2ffdd7eacff24b6.yaml |  15 ++
+ 3 files changed, 156 insertions(+), 105 deletions(-)
+ create mode 100644 releasenotes/notes/redfish-powering-off-transitional-c2ffdd7eacff24b6.yaml
+
+diff --git a/ironic/drivers/modules/redfish/power.py b/ironic/drivers/modules/redfish/power.py
+index 8f977cc38..d964eced5 100644
+--- a/ironic/drivers/modules/redfish/power.py
++++ b/ironic/drivers/modules/redfish/power.py
+@@ -16,13 +16,14 @@
+ import time
+ 
+ from oslo_log import log
++from oslo_service import loopingcall
+ import sushy
+ 
+ from ironic.common import exception
+ from ironic.common.i18n import _
+ from ironic.common import states
+ from ironic.conductor import task_manager
+-from ironic.conductor import utils as cond_utils
++from ironic.conf import CONF
+ from ironic.drivers import base
+ from ironic.drivers.modules.redfish import management as redfish_mgmt
+ from ironic.drivers.modules.redfish import utils as redfish_utils
+@@ -33,7 +34,9 @@ GET_POWER_STATE_MAP = {
+     sushy.SYSTEM_POWER_STATE_ON: states.POWER_ON,
+     sushy.SYSTEM_POWER_STATE_POWERING_ON: states.POWER_ON,
+     sushy.SYSTEM_POWER_STATE_OFF: states.POWER_OFF,
+-    sushy.SYSTEM_POWER_STATE_POWERING_OFF: states.POWER_OFF
++    # PoweringOff is transitional; mapping it to POWER_OFF makes Ironic think
++    # the host is already off and can issue power-on while the BMC is still
++    # shutting down (some BMCs then accept but ignore ResetType On).
+ }
+ 
+ SET_POWER_STATE_MAP = {
+@@ -51,6 +54,58 @@ TARGET_STATE_MAP = {
+ }
+ 
+ 
++def _redfish_target_power_state_reached(
++        sushy_power_state, target_ironic_state):
++    """Whether Redfish power state satisfies the requested Ironic target.
++
++    Uses raw Redfish values so we do not treat transitional states (e.g.
++    ``PoweringOff``) as a stable power off.
++    """
++    if target_ironic_state == states.POWER_OFF:
++        return sushy_power_state == sushy.SYSTEM_POWER_STATE_OFF
++    if target_ironic_state == states.POWER_ON:
++        return sushy_power_state in (
++            sushy.SYSTEM_POWER_STATE_ON,
++            sushy.SYSTEM_POWER_STATE_POWERING_ON,
++        )
++    return False
++
++
++def _wait_redfish_system_power_state(task, system, target_ironic_state,
++                                     timeout=None):
++    """Poll the BMC until ``target_ironic_state`` is reached.
++
++    Each iteration calls :meth:`system.refresh` so the observed state is
++    fetched from Redfish, not a stale in-memory representation.
++    """
++    retry_timeout = timeout or CONF.conductor.power_state_change_timeout
++
++    def _wait():
++        try:
++            system.refresh()
++        except Exception as err:
++            LOG.debug('Redfish System.refresh while waiting for %(target)s '
++                      'on node %(node)s: %(err)s',
++                      {'target': target_ironic_state, 'node': task.node.uuid,
++                       'err': err})
++            return False
++        if _redfish_target_power_state_reached(system.power_state,
++                                               target_ironic_state):
++            raise loopingcall.LoopingCallDone()
++        return False
++
++    try:
++        timer = loopingcall.BackOffLoopingCall(_wait)
++        timer.start(initial_delay=1, timeout=retry_timeout).wait()
++    except loopingcall.LoopingCallTimeOut:
++        LOG.error('Timed out after %(retry_timeout)s secs waiting for '
++                  '%(state)s on node %(node_id)s (Redfish refresh loop).',
++                  {'retry_timeout': retry_timeout,
++                   'state': target_ironic_state,
++                   'node_id': task.node.uuid})
++        raise exception.PowerStateFailure(pstate=target_ironic_state)
++
++
+ def _set_power_state(task, system, power_state, timeout=None):
+     """An internal helper to set a power state on the system.
+ 
+@@ -62,14 +117,18 @@ def _set_power_state(task, system, power_state, timeout=None):
+     :raises: RedfishConnectionError when it fails to connect to Redfish
+     :raises: RedfishError on an error from the Sushy library
+     """
+-    system.reset_system(SET_POWER_STATE_MAP.get(power_state))
++    reset_type = SET_POWER_STATE_MAP.get(power_state)
+     target_state = TARGET_STATE_MAP.get(power_state, power_state)
++    timeout_val = timeout or CONF.conductor.power_state_change_timeout
++
++    system.reset_system(reset_type)
+     if power_state == states.REBOOT:
+         LOG.debug('Waiting 15 seconds to give the node %s a chance to power '
+                   'off before checking its power state', task.node.uuid)
+         time.sleep(15)
+-    cond_utils.node_wait_for_power_state(task, target_state,
+-                                         timeout=timeout)
++
++    _wait_redfish_system_power_state(task, system, target_state,
++                                     timeout=timeout_val)
+ 
+ 
+ class RedfishPower(base.PowerInterface):
+@@ -94,7 +153,10 @@ class RedfishPower(base.PowerInterface):
+         """Get the current power state of the task's node.
+ 
+         :param task: a TaskManager instance containing the node to act on.
+-        :returns: a power state. One of :mod:`ironic.common.states`.
++        :returns: a power state, one of :mod:`ironic.common.states`, or
++            :data:`ironic.common.states.NOSTATE` (``None``) when the BMC
++            reports a transitional or unknown Redfish power state
++            (e.g. ``PoweringOff``).
+         :raises: InvalidParameterValue on malformed parameter(s)
+         :raises: MissingParameterValue on missing parameter(s)
+         :raises: RedfishConnectionError when it fails to connect to Redfish
+diff --git a/ironic/tests/unit/drivers/modules/redfish/test_power.py b/ironic/tests/unit/drivers/modules/redfish/test_power.py
+index 0e6d197be..625df9b93 100644
+--- a/ironic/tests/unit/drivers/modules/redfish/test_power.py
++++ b/ironic/tests/unit/drivers/modules/redfish/test_power.py
+@@ -13,11 +13,10 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
+-import time
+ from unittest import mock
+ 
+-from oslo_service import loopingcall as lc
+ import sushy
++from oslo_service import loopingcall as lc
+ 
+ from ironic.common import exception
+ from ironic.common import states
+@@ -32,6 +31,25 @@ from ironic.tests.unit.objects import utils as obj_utils
+ INFO_DICT = db_utils.get_test_redfish_info()
+ 
+ 
++def _system_mock_with_refresh_progression(power_states):
++    """Mock Redfish System; each refresh() advances along power_states.
++
++    Mirrors production behavior where :meth:`_wait_redfish_system_power_state`
++    calls ``system.refresh()`` then reads ``system.power_state``.
++    """
++    m = mock.Mock()
++    seq = list(power_states)
++    idx = [0]
++
++    def refresh():
++        idx[0] = min(idx[0] + 1, len(seq) - 1)
++        m.power_state = seq[idx[0]]
++
++    m.power_state = seq[0]
++    m.refresh.side_effect = refresh
++    return m
++
++
+ class RedfishPowerTestCase(db_base.DbTestCase):
+ 
+     def setUp(self):
+@@ -67,7 +85,7 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+                 (sushy.SYSTEM_POWER_STATE_ON, states.POWER_ON),
+                 (sushy.SYSTEM_POWER_STATE_POWERING_ON, states.POWER_ON),
+                 (sushy.SYSTEM_POWER_STATE_OFF, states.POWER_OFF),
+-                (sushy.SYSTEM_POWER_STATE_POWERING_OFF, states.POWER_OFF)
++                (sushy.SYSTEM_POWER_STATE_POWERING_OFF, None),
+             ]
+             for current, expected in expected_values:
+                 mock_get_system.return_value = mock.Mock(power_state=current)
+@@ -76,13 +94,12 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+                 mock_get_system.assert_called_once_with(task.node)
+                 mock_get_system.reset_mock()
+ 
+-    @mock.patch.object(lc.BackOffLoopingCall, '_sleep', autospec=True)
+     @mock.patch('time.sleep', autospec=True)
+     @mock.patch.object(redfish_mgmt.RedfishManagement, 'restore_boot_device',
+                        autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+     def test_set_power_state(self, mock_get_system, mock_restore_bootdev,
+-                             mock_sleep, mock_lc_sleep):
++                             mock_sleep):
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+             expected_values = [
+@@ -103,20 +120,18 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+                     final = sushy.SYSTEM_POWER_STATE_ON
+                     transient = sushy.SYSTEM_POWER_STATE_OFF
+ 
+-                system_result = [
+-                    mock.Mock(power_state=transient)
+-                ] * 3 + [mock.Mock(power_state=final)]
+-                mock_get_system.side_effect = system_result
++                progression = [transient] * 4 + [final]
++                sys_m = _system_mock_with_refresh_progression(progression)
++                mock_get_system.return_value = sys_m
+ 
+                 task.driver.power.set_power_state(task, target)
+ 
+                 # Asserts
+-                system_result[0].reset_system.assert_called_once_with(expected)
+-                mock_get_system.assert_called_with(task.node)
+-                self.assertEqual(4, mock_get_system.call_count)
++                sys_m.reset_system.assert_called_once_with(expected)
++                mock_get_system.assert_called_once_with(task.node)
+                 if restore_bootdev:
+                     mock_restore_bootdev.assert_called_once_with(
+-                        task.driver.management, task, system_result[0])
++                        task.driver.management, task, sys_m)
+                 else:
+                     self.assertFalse(mock_restore_bootdev.called)
+                 if sleeps:
+@@ -129,11 +144,9 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+                 mock_restore_bootdev.reset_mock()
+                 mock_sleep.reset_mock()
+ 
+-    @mock.patch.object(lc.BackOffLoopingCall, '_sleep', autospec=True)
+     @mock.patch('time.sleep', autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+-    def test_set_power_state_not_reached(self, mock_get_system, mock_sleep,
+-                                         mock_lc_sleep):
++    def test_set_power_state_not_reached(self, mock_get_system, mock_sleep):
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+             self.config(power_state_change_timeout=2, group='conductor')
+@@ -158,7 +171,7 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+ 
+                 # Asserts
+                 fake_system.reset_system.assert_called_once_with(expected)
+-                mock_get_system.assert_called_with(task.node)
++                mock_get_system.assert_called_once_with(task.node)
+ 
+                 # Reset mocks
+                 mock_get_system.reset_mock()
+@@ -366,136 +379,102 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+             log_msg = mock_log.call_args[0][0]
+             self.assertIn('Failed to refresh system state', log_msg)
+ 
+-    @mock.patch.object(lc.BackOffLoopingCall, '_sleep', autospec=True)
+     @mock.patch.object(redfish_mgmt.RedfishManagement, 'restore_boot_device',
+                        autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+     def test_reboot_from_power_off(self, mock_get_system,
+-                                   mock_restore_bootdev, mock_lc_sleep):
++                                   mock_restore_bootdev):
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+-            system_result = [
+-                # Initial state
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_OFF),
+-                # Transient state - still powered off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_OFF),
+-                # Final state - down powering off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON)
+-            ]
+-            mock_get_system.side_effect = system_result
++            off = sushy.SYSTEM_POWER_STATE_OFF
++            on = sushy.SYSTEM_POWER_STATE_ON
++            sys_m = _system_mock_with_refresh_progression([off, off, off, on])
++            mock_get_system.return_value = sys_m
+ 
+             task.driver.power.reboot(task)
+ 
+             # Asserts
+-            system_result[0].reset_system.assert_called_once_with(
+-                sushy.RESET_ON)
+-            mock_get_system.assert_called_with(task.node)
+-            self.assertEqual(3, mock_get_system.call_count)
++            sys_m.reset_system.assert_called_once_with(sushy.RESET_ON)
++            mock_get_system.assert_called_once_with(task.node)
+             mock_restore_bootdev.assert_called_once_with(
+-                task.driver.management, task, system_result[0])
++                task.driver.management, task, sys_m)
+ 
+-    @mock.patch.object(lc.BackOffLoopingCall, '_sleep', autospec=True)
+     @mock.patch.object(redfish_mgmt.RedfishManagement, 'restore_boot_device',
+                        autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+     def test_reboot_from_power_off_with_disable_power_off(
+-            self, mock_get_system, mock_restore_bootdev, mock_lc_sleep):
++            self, mock_get_system, mock_restore_bootdev):
+         # NOTE(dtantsur): if a node with disable_power_off is powered off, we
+         # probably cannot do anything about it. This unit test is only here
+         # for consistent coverage.
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+             task.node.disable_power_off = True
+-            system_result = [
+-                # Initial state
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_OFF),
+-                # Transient state - still powered off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_OFF),
+-                # Final state - down powering off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON)
+-            ]
+-            mock_get_system.side_effect = system_result
++            off = sushy.SYSTEM_POWER_STATE_OFF
++            on = sushy.SYSTEM_POWER_STATE_ON
++            sys_m = _system_mock_with_refresh_progression([off, off, off, on])
++            mock_get_system.return_value = sys_m
+ 
+             task.driver.power.reboot(task)
+ 
+             # Asserts
+-            system_result[0].reset_system.assert_called_once_with(
+-                sushy.RESET_ON)
+-            mock_get_system.assert_called_with(task.node)
+-            self.assertEqual(3, mock_get_system.call_count)
++            sys_m.reset_system.assert_called_once_with(sushy.RESET_ON)
++            mock_get_system.assert_called_once_with(task.node)
+             mock_restore_bootdev.assert_called_once_with(
+-                task.driver.management, task, system_result[0])
++                task.driver.management, task, sys_m)
+ 
+-    @mock.patch.object(lc.BackOffLoopingCall, '_sleep', autospec=True)
+     @mock.patch.object(redfish_mgmt.RedfishManagement, 'restore_boot_device',
+                        autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+-    def test_reboot_from_power_on(self, mock_get_system, mock_restore_bootdev,
+-                                  mock_lc_sleep):
++    def test_reboot_from_power_on(self, mock_get_system, mock_restore_bootdev):
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+-            system_result = [
+-                # Initial state
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON),
+-                # Transient state - powering off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_OFF),
+-                # Final state - down powering off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON)
+-            ]
+-            mock_get_system.side_effect = system_result
++            on = sushy.SYSTEM_POWER_STATE_ON
++            off = sushy.SYSTEM_POWER_STATE_OFF
++            po = sushy.SYSTEM_POWER_STATE_POWERING_OFF
++            progression = [on, po, off, off, on]
++            sys_m = _system_mock_with_refresh_progression(progression)
++            mock_get_system.return_value = sys_m
+ 
+             task.driver.power.reboot(task)
+ 
+             # Asserts
+-            system_result[0].reset_system.assert_has_calls([
++            sys_m.reset_system.assert_has_calls([
+                 mock.call(sushy.RESET_FORCE_OFF),
+                 mock.call(sushy.RESET_ON),
+             ])
+-            mock_get_system.assert_called_with(task.node)
+-            self.assertEqual(3, mock_get_system.call_count)
++            mock_get_system.assert_called_once_with(task.node)
+             mock_restore_bootdev.assert_called_once_with(
+-                task.driver.management, task, system_result[0])
++                task.driver.management, task, sys_m)
+ 
+-    @mock.patch.object(lc.BackOffLoopingCall, '_sleep', autospec=True)
+     @mock.patch('time.sleep', autospec=True)
+     @mock.patch.object(redfish_mgmt.RedfishManagement, 'restore_boot_device',
+                        autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+     def test_reboot_from_power_on_with_disable_power_off(
+-            self, mock_get_system, mock_restore_bootdev, mock_sleep,
+-            mock_lc_sleep):
++            self, mock_get_system, mock_restore_bootdev, mock_sleep):
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+             task.node.disable_power_off = True
+-            system_result = [
+-                # Initial state
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON),
+-                # Transient state - powering off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_OFF),
+-                # Final state - down powering off
+-                mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON)
+-            ]
+-            mock_get_system.side_effect = system_result
++            on = sushy.SYSTEM_POWER_STATE_ON
++            progression = [on, on, on, on, on]
++            sys_m = _system_mock_with_refresh_progression(progression)
++            mock_get_system.return_value = sys_m
+ 
+             task.driver.power.reboot(task)
+ 
+             # Asserts
+-            system_result[0].reset_system.assert_called_once_with(
++            sys_m.reset_system.assert_called_once_with(
+                 sushy.RESET_FORCE_RESTART)
+-            mock_get_system.assert_called_with(task.node)
+-            self.assertEqual(3, mock_get_system.call_count)
++            mock_get_system.assert_called_once_with(task.node)
+             mock_restore_bootdev.assert_called_once_with(
+-                task.driver.management, task, system_result[0])
++                task.driver.management, task, sys_m)
+             mock_sleep.assert_called_with(15)
+ 
+-    @mock.patch.object(lc.BackOffLoopingCall, '_sleep', autospec=True)
+-    @mock.patch.object(time, 'sleep', autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+-    def test_reboot_not_reached(self, mock_get_system, mock_sleep,
+-                                mock_lc_sleep):
++    def test_reboot_not_reached(self, mock_get_system):
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+-            self.config(power_state_change_timeout=2, group='conductor')
+             fake_system = mock_get_system.return_value
+             fake_system.power_state = sushy.SYSTEM_POWER_STATE_OFF
+ 
+@@ -504,8 +483,7 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+ 
+             # Asserts
+             fake_system.reset_system.assert_called_once_with(sushy.RESET_ON)
+-            mock_get_system.assert_called_with(task.node)
+-            mock_sleep.assert_called_with(0)
++            mock_get_system.assert_called_once_with(task.node)
+ 
+     @mock.patch.object(sushy, 'Sushy', autospec=True)
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+@@ -529,16 +507,12 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+     def test_reboot_fail_on_power_on(self, mock_get_system, mock_sushy,
+                                      mock_lc_sleep):
+-        system_result = [
+-            # Initial state
+-            mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON),
+-            # Transient state - powering off
+-            mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_OFF),
+-            # Final state - down powering off
+-            mock.Mock(power_state=sushy.SYSTEM_POWER_STATE_ON)
+-        ]
+-        mock_get_system.side_effect = system_result
+-        fake_system = system_result[0]
++        on = sushy.SYSTEM_POWER_STATE_ON
++        off = sushy.SYSTEM_POWER_STATE_OFF
++        po = sushy.SYSTEM_POWER_STATE_POWERING_OFF
++        progression = [on, po, off, off, on]
++        fake_system = _system_mock_with_refresh_progression(progression)
++        mock_get_system.return_value = fake_system
+         fake_system.reset_system.side_effect = [
+             None,
+             sushy.exceptions.SushyError(),
+@@ -553,7 +527,7 @@ class RedfishPowerTestCase(db_base.DbTestCase):
+                 mock.call(sushy.RESET_FORCE_OFF),
+                 mock.call(sushy.RESET_ON),
+             ])
+-            mock_get_system.assert_called_with(task.node)
++            mock_get_system.assert_called_once_with(task.node)
+ 
+     def test_get_supported_power_states(self):
+         with task_manager.acquire(self.context, self.node.uuid,
+diff --git a/releasenotes/notes/redfish-powering-off-transitional-c2ffdd7eacff24b6.yaml b/releasenotes/notes/redfish-powering-off-transitional-c2ffdd7eacff24b6.yaml
+new file mode 100644
+index 000000000..c646e9e34
+--- /dev/null
++++ b/releasenotes/notes/redfish-powering-off-transitional-c2ffdd7eacff24b6.yaml
+@@ -0,0 +1,15 @@
++---
++fixes:
++  - |
++    The Redfish power driver no longer maps the BMC ``PoweringOff`` state to
++    Ironic ``power off``. Ironic now keeps waiting until the machine reports
++    ``Off``, avoiding an immediate power-on while the system is still shutting
++    down (which some BMCs accept but ignore). Transitional/unknown Redfish
++    power states are reported as ``None`` to the conductor; periodic power
++    sync skips a cycle instead of clearing the database power state.
++features:
++  - |
++    New ``[redfish]power_on_wait_phases`` option (default ``1``). When set
++    above ``1``, power-on waits split ``power_state_change_timeout`` into
++    segments and re-issue the power-on reset between segments if the node is
++    still off, as a workaround for BMCs that drop the first request.
+-- 
+2.39.5 (Apple Git-154)
+
