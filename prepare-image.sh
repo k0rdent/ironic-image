@@ -71,12 +71,6 @@ rm -f /usr/share/ironic/ironic-dist.conf
 # add ironic to apache group
 usermod -aG ironic apache
 
-# apply patches if present #
-if [[ -n "${PATCH_LIST:-}" ]]; then
-    if [[ -s "/tmp/${PATCH_LIST}" ]]; then
-        /bin/patch-image.sh
-    fi
-fi
 rm -f /bin/patch-image.sh
 
 microdnf clean all
