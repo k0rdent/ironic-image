@@ -41,16 +41,18 @@ LABEL org.opencontainers.image.vendor="Metal3-io"
 
 ARG PKGS_LIST=main-packages-list.txt
 ARG EXTRA_PKGS_LIST
-ARG PATCH_LIST
 
 # build arguments for source build customization
 ARG UPPER_CONSTRAINTS_FILE=upper-constraints.txt
 ARG IRONIC_SOURCE=a26e740d8413f35fb8014a899ad704207374369a # stable/2026.1
 ARG SUSHY_SOURCE
+ARG GIT_HOST=https://opendev.org
+ENV GIT_HOST=${GIT_HOST}
 
 COPY sources /sources/
+COPY patches /tmp/patches/
 COPY ${UPPER_CONSTRAINTS_FILE} ironic-packages-list ${PKGS_LIST} \
-     ${EXTRA_PKGS_LIST:-$PKGS_LIST} ${PATCH_LIST:-$PKGS_LIST} \
+     ${EXTRA_PKGS_LIST:-$PKGS_LIST} \
      /tmp/
 COPY ironic-config/inspector.ipxe.j2 ironic-config/httpd-ironic-api.conf.j2 \
      ironic-config/ipxe_config.template ironic-config/dnsmasq.conf.j2 \

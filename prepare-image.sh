@@ -47,6 +47,11 @@ IRONIC_PKG_LIST_FINAL="/tmp/ironic-packages-list-final"
 
 python3.12 -c 'import os; import sys; import jinja2; sys.stdout.write(jinja2.Template(sys.stdin.read()).render(env=os.environ, path=os.path))' < "${IRONIC_PKG_LIST}" > "${IRONIC_PKG_LIST_FINAL}"
 
+# Replace git requirements with patched /sources checkouts when patches/<project> exists.
+if [[ -d /tmp/patches ]]; then
+    /bin/patch-image.sh
+fi
+
 if [[ -n ${SUSHY_SOURCE:-} ]]; then
     sed -i '/^sushy===/d' "${UPPER_CONSTRAINTS_PATH}"
 fi
@@ -83,12 +88,6 @@ rm -f /usr/share/ironic/ironic-dist.conf
 # add ironic to apache group
 usermod -aG ironic apache
 
-# apply patches if present #
-if [[ -n "${PATCH_LIST:-}" ]]; then
-    if [[ -s "/tmp/${PATCH_LIST}" ]]; then
-        /bin/patch-image.sh
-    fi
-fi
 rm -f /bin/patch-image.sh
 
 dnf clean all
