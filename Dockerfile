@@ -10,7 +10,6 @@ ARG SETUPTOOLS_VERSION=82.0.1
 
 FROM $BASE_IMAGE AS ironic-builder
 
-ARG IPXE_COMMIT_HASH=d0ea2b1bb8f78b219f74424d435b92ff8aa0ea8d
 ARG TARGETARCH
 
 WORKDIR /tmp
@@ -18,9 +17,6 @@ WORKDIR /tmp
 COPY prepare-ipxe.sh /bin/
 RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \ 
   prepare-ipxe.sh
-
-COPY build-ipxe.sh /bin/
-RUN build-ipxe.sh
 
 COPY prepare-efi.sh /bin/
 RUN prepare-efi.sh centos
@@ -123,7 +119,7 @@ RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
      rm -f /bin/prepare-image.sh
 
 # IRONIC #
-COPY --from=ironic-builder /tmp/ipxe/out/ /tftpboot/
+RUN mkdir -p /tftpboot/
 COPY --from=ironic-builder /tmp/uefi_esp*.img /templates/
 
 COPY ironic-config/ironic.conf.j2 /etc/ironic/
