@@ -24,6 +24,11 @@ IRONIC_PKG_LIST_FINAL="/tmp/ironic-packages-list-final"
 # Render the Jinja2 template for the package list
 python3.12 -c 'import os; import sys; import jinja2; sys.stdout.write(jinja2.Template(sys.stdin.read()).render(env=os.environ, path=os.path))' < "${IRONIC_PKG_LIST}" > "${IRONIC_PKG_LIST_FINAL}"
 
+# Replace git requirements with patched /sources checkouts when patches/<project> exists.
+if [[ -d /tmp/patches ]]; then
+    /bin/patch-image.sh
+fi
+
 # Remove sushy constraint if building from source
 if [[ -n ${SUSHY_SOURCE:-} ]]; then
     sed -i '/^sushy===/d' "${UPPER_CONSTRAINTS_PATH}"

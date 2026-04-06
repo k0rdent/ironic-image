@@ -50,6 +50,10 @@ RUN IRONIC_PKG_LIST=/tmp/ironic-deps-list /bin/build-wheels.sh
 ## Build Ironic and Sushy wheels
 FROM $BASE_IMAGE AS ironic-wheel-builder
 
+## Build arguments for source build customization
+ARG GIT_HOST=https://opendev.org
+ENV GIT_HOST=${GIT_HOST}
+
 ARG UPPER_CONSTRAINTS_FILE=upper-constraints.txt
 ARG IRONIC_SOURCE=a26e740d8413f35fb8014a899ad704207374369a # stable/2026.1
 ARG SUSHY_SOURCE
@@ -76,6 +80,8 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
 COPY sources /sources/
 COPY ${UPPER_CONSTRAINTS_FILE} ironic-packages-list /tmp/
 COPY build-wheels.sh /bin/
+COPY patch-image.sh /bin/
+COPY patches /tmp/patches/
 
 RUN /bin/build-wheels.sh
 
@@ -102,13 +108,12 @@ ARG TARGETARCH
 ARG PKGS_LIST=main-packages-list.txt
 ARG ARCH_PKGS_LIST=main-packages-list-${TARGETARCH}.txt
 ARG EXTRA_PKGS_LIST
-ARG PATCH_LIST
 
-COPY ${PKGS_LIST} ${ARCH_PKGS_LIST} ${EXTRA_PKGS_LIST:-$PKGS_LIST} ${PATCH_LIST:-$PKGS_LIST} /tmp/
+COPY ${PKGS_LIST} ${ARCH_PKGS_LIST} ${EXTRA_PKGS_LIST:-$PKGS_LIST} /tmp/
 COPY ironic-config/inspector.ipxe.j2 ironic-config/httpd-ironic-api.conf.j2 \
      ironic-config/ipxe_config.template ironic-config/dnsmasq.conf.j2 \
      /templates/
-COPY prepare-image.sh patch-image.sh configure-nonroot.sh /bin/
+COPY prepare-image.sh configure-nonroot.sh /bin/
 COPY scripts/ /bin/
 
 # Install Python packages from pre-built wheels (mounted from both wheel-builder stages)
