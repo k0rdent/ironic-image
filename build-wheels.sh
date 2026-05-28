@@ -34,6 +34,9 @@ if [[ -n ${SUSHY_SOURCE:-} ]]; then
     sed -i '/^sushy===/d' "${UPPER_CONSTRAINTS_PATH}"
 fi
 
+#FIXME: Bump sushy to avoid https://bugs.launchpad.net/sushy/+bug/2146416
+sed -i 's/sushy===5.10.0/sushy===5.10.1/g' "${UPPER_CONSTRAINTS_PATH}"
+
 # Build wheels for all packages
 # Note: some packages may not produce wheels (pure Python), but pip wheel handles this
 python3.12 -m pip wheel \
